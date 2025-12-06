@@ -44,49 +44,74 @@ const github_1 = __nccwpck_require__(5438);
 const httpm = __importStar(__nccwpck_require__(6255));
 const safe_1 = __nccwpck_require__(7526);
 const core = __importStar(__nccwpck_require__(2186));
-function generateMessage(notificationTitle, users, contentWorkflowsStatus, secret) {
+function generateAt(contentWorkflowsStatus, openIDs) {
+    let contentAt = '';
+    switch (contentWorkflowsStatus.toLowerCase()) {
+        case 'success':
+            contentAt = '审核人：'.toString();
+            break;
+        default:
+            contentAt = '创建人：'.toString();
+    }
+    for (const openID of openIDs) {
+        contentAt = contentAt + `<at id='${openID}'></at> `.toString();
+    }
+    return contentAt;
+}
+function generateMessage(templateID, notificationTitle, users, reviewers, contentWorkflowsStatus, secret) {
     var _a, _b;
     const contentPRUrl = ((_a = github_1.context.payload.pull_request) === null || _a === void 0 ? void 0 : _a.html_url) || '';
-    let contentUserID = '';
-    const userArr = users.split(',');
-    for (const user of userArr) {
-        const strs = user.split('|');
-        if (strs.length !== 2) {
-            throw new Error('the secret users is error');
-        }
-        if (strs[0] === github_1.context.actor) {
-            contentUserID = strs[1];
-        }
-    }
-    if (contentUserID === '') {
-        throw new Error('no this user in secret users, skip notify');
-    }
     contentWorkflowsStatus = contentWorkflowsStatus.toUpperCase();
     const contentPRTitle = (_b = github_1.context.payload.pull_request) === null || _b === void 0 ? void 0 : _b.title;
     let contentWorkflowsStatusColor;
-    switch (contentWorkflowsStatus.toLowerCase()) {
-        case 'success':
+    switch (contentWorkflowsStatus) {
+        case 'SUCCESS':
             contentWorkflowsStatusColor = 'green';
             break;
         default:
             contentWorkflowsStatusColor = 'red';
     }
-    const buttonPRUrL = contentPRUrl;
+    let openIDs = [];
+    // success, notify reviewers
+    if (contentWorkflowsStatus === 'SUCCESS') {
+        openIDs = reviewers.split(',');
+    }
+    else {
+        // fail, notify creator
+        const userArr = users.split(',');
+        for (const user of userArr) {
+            const userMapping = user.split('|');
+            if (userMapping.length !== 2) {
+                throw new Error('the secret users is error');
+            }
+            if (userMapping[0] === github_1.context.actor) {
+                openIDs.push(userMapping[1]);
+                break;
+            }
+        }
+        // pr's actor is not in users, skip notify
+        if (openIDs.length === 0) {
+            core.info('no this user in secret users, skip notify');
+            return;
+        }
+    }
+    const contentAt = generateAt(contentWorkflowsStatus, openIDs);
     const msgCard = {
         type: 'template',
         data: {
-            template_id: 'ctp_AAgXNqY1B7oP',
+            template_id: templateID,
             template_variable: {
                 notification_title: notificationTitle,
                 content_pr_url: contentPRUrl,
-                content_user_id: contentUserID,
+                content_at: contentAt,
+                content_pr_title: contentPRTitle,
                 content_workflows_status: contentWorkflowsStatus,
                 content_workflows_status_color: contentWorkflowsStatusColor,
-                content_pr_title: contentPRTitle,
-                button_pr_url: buttonPRUrL
+                button_pr_url: contentPRUrl
             }
         }
     };
+    // generate sign
     const now = Math.floor(Date.now() / 1000).toString();
     core.info(`timestamp: ${now}`);
     const signature = (0, safe_1.generateSignature)(now, secret);
@@ -172,13 +197,18 @@ function run() {
                 token: tk
             });
             core.info(`the workflows status is ${status}`);
+            const templateID = core.getInput('template_id');
             const notificationTitle = core.getInput('notification_title');
             const users = core.getInput('users');
+            const reviewers = core.getInput('reviewers');
             const secret = core.getInput('secret');
-            const msg = (0, lark_1.generateMessage)(notificationTitle, users, status, secret);
-            core.info('send notification to lark');
-            const webhook = core.getInput('webhook');
-            yield (0, lark_1.notify)(webhook, msg);
+            const msg = (0, lark_1.generateMessage)(templateID, notificationTitle, users, reviewers, status, secret);
+            // need notify
+            if (msg != null) {
+                core.info('send notification to lark');
+                const webhook = core.getInput('webhook');
+                yield (0, lark_1.notify)(webhook, msg);
+            }
             core.info('finalize');
         }
         catch (error) {
@@ -286,46 +316,31 @@ function wait(milliseconds) {
     });
 }
 function polling(options) {
-    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const { timeoutSeconds, intervalSeconds, token } = options;
         let now = new Date().getTime();
         const deadline = now + timeoutSeconds * 1000;
-        const headSha = (_a = github_1.context.payload.pull_request) === null || _a === void 0 ? void 0 : _a.head.sha;
-        const http = new httpm.HttpClient('lark-pr-notify-action');
-        const url = `${github_1.context.apiUrl}/repos/${github_1.context.repo.owner}/${github_1.context.repo.repo}/actions/runs?head_sha=${headSha}`;
-        let headers = {};
-        if (token !== '') {
-            headers = {
-                Authorization: `Bearer ${token}`
-            };
-        }
-        let isCompleted;
         let isSuccess;
+        let actionStatus = {
+            isCompleted: false,
+            isSuccess: false
+        };
+        let checkStatus = {
+            isCompleted: false,
+            isSuccess: false
+        };
         while (now < deadline) {
-            isCompleted = true;
-            isSuccess = true;
-            const response = yield http.get(url, headers);
-            const body = yield response.readBody();
-            const workflows = JSON.parse(body);
-            for (const workflow of workflows.workflow_runs) {
-                if (github_1.context.workflow === workflow.name) {
-                    continue;
-                }
-                core.info(`action ${workflow.name}'s status is ${workflow.status} and conclusion is ${workflow.conclusion}`);
-                if (workflow.status !== 'completed') {
-                    isCompleted = false;
-                }
-                if (workflow.conclusion === 'failure') {
-                    isSuccess = false;
-                }
+            actionStatus = yield checkActions(actionStatus, token);
+            checkStatus = yield checkChecks(checkStatus, token);
+            if (!actionStatus.isCompleted || !checkStatus.isCompleted) {
+                core.info('waiting...');
+                yield wait(intervalSeconds * 1000);
+                now = new Date().getTime();
             }
-            if (isCompleted) {
+            else {
+                isSuccess = actionStatus.isSuccess && checkStatus.isSuccess;
                 break;
             }
-            core.info('waiting...');
-            yield wait(intervalSeconds * 1000);
-            now = new Date().getTime();
         }
         if (now >= deadline || !isSuccess) {
             return 'failure';
@@ -336,6 +351,102 @@ function polling(options) {
     });
 }
 exports.polling = polling;
+function checkActions(actionStatus, token) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        // actions check is completed return last status
+        if (actionStatus.isCompleted) {
+            return actionStatus;
+        }
+        const headSha = (_a = github_1.context.payload.pull_request) === null || _a === void 0 ? void 0 : _a.head.sha;
+        const http = new httpm.HttpClient('lark-pr-notify-action');
+        const url = `${github_1.context.apiUrl}/repos/${github_1.context.repo.owner}/${github_1.context.repo.repo}/actions/runs?head_sha=${headSha}`;
+        let headers = {};
+        if (token && token !== '') {
+            headers = {
+                Authorization: `Bearer ${token}`
+            };
+        }
+        const response = yield http.get(url, headers);
+        const body = yield response.readBody();
+        const workflows = JSON.parse(body);
+        let isCompleted = true;
+        let isSuccess = true;
+        for (const workflow of workflows.workflow_runs) {
+            // ignore lark-pr-notify-action
+            if (github_1.context.workflow === workflow.name) {
+                continue;
+            }
+            core.info(`action ${workflow.name}'s status is ${workflow.status} and conclusion is ${workflow.conclusion}`);
+            if (workflow.status !== 'completed') {
+                isCompleted = false;
+            }
+            if (workflow.conclusion !== 'success') {
+                isSuccess = false;
+            }
+        }
+        return {
+            isCompleted,
+            isSuccess
+        };
+    });
+}
+function checkChecks(checkStatus, token) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        if (checkStatus.isCompleted) {
+            return checkStatus;
+        }
+        const headSha = (_a = github_1.context.payload.pull_request) === null || _a === void 0 ? void 0 : _a.head.sha;
+        const http = new httpm.HttpClient('lark-pr-notify-action');
+        const url = `${github_1.context.apiUrl}/repos/${github_1.context.repo.owner}/${github_1.context.repo.repo}/commits/${headSha}/check-runs`;
+        let headers = {};
+        if (token && token !== '') {
+            headers = {
+                Authorization: `Bearer ${token}`
+            };
+        }
+        const response = yield http.get(url, headers);
+        const body = yield response.readBody();
+        const checks = JSON.parse(body);
+        let isCompleted = true;
+        let isSuccess = true;
+        for (const check of checks.check_runs) {
+            const workflowName = yield getWorkflowNameByJobID(check.id, token);
+            // ignore lark-pr-notify-action
+            if (github_1.context.workflow === workflowName) {
+                continue;
+            }
+            core.info(`check ${check.name}'s status is ${check.status} and conclusion is ${check.conclusion}`);
+            if (check.status !== 'completed') {
+                isCompleted = false;
+            }
+            if (check.conclusion !== 'success') {
+                isSuccess = false;
+            }
+        }
+        return {
+            isCompleted,
+            isSuccess
+        };
+    });
+}
+function getWorkflowNameByJobID(jobID, token) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const http = new httpm.HttpClient('lark-pr-notify-action');
+        const url = `${github_1.context.apiUrl}/repos/${github_1.context.repo.owner}/${github_1.context.repo.repo}/actions/jobs/${jobID}`;
+        let headers = {};
+        if (token && token !== '') {
+            headers = {
+                Authorization: `Bearer ${token}`
+            };
+        }
+        const response = yield http.get(url, headers);
+        const body = yield response.readBody();
+        const info = JSON.parse(body);
+        return info.workflow_name;
+    });
+}
 
 
 /***/ }),

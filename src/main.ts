@@ -15,14 +15,25 @@ async function run(): Promise<void> {
         })
 
         core.info(`the workflows status is ${status}`)
+        const templateID = core.getInput('template_id')
         const notificationTitle = core.getInput('notification_title')
         const users = core.getInput('users')
+        const reviewers = core.getInput('reviewers')
         const secret = core.getInput('secret')
-        const msg = generateMessage(notificationTitle, users, status, secret)
-
-        core.info('send notification to lark')
-        const webhook = core.getInput('webhook')
-        await notify(webhook, msg)
+        const msg = generateMessage(
+            templateID,
+            notificationTitle,
+            users,
+            reviewers,
+            status,
+            secret
+        )
+        // need notify
+        if (msg != null) {
+            core.info('send notification to lark')
+            const webhook = core.getInput('webhook')
+            await notify(webhook, msg)
+        }
         core.info('finalize')
     } catch (error) {
         if (error instanceof Error) core.setFailed(error.message)
